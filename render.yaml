@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: portfolio-agent
+    runtime: docker
+    plan: free
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: CORS_ORIGINS
+        value: https://your-portfolio.netlify.app
+      - key: LOG_LEVEL
+        value: INFO
+      - key: CHROMA_PERSIST_DIR
+        value: index

@@ -1,0 +1,16 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - CORS_ORIGINS=http://localhost:5173
+    volumes:
+      - .:/app
+      - chroma_index:/app/index
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  chroma_index:
