@@ -7,6 +7,7 @@ from typing import Any
 from agents.context import build_system_prompt
 from providers.groq import GroqProvider
 from providers.gemini import GeminiProvider
+from providers.nim import NIMProvider
 from providers.ollama import OllamaProvider
 from providers.base import LLMProvider, ProviderQuotaExceeded
 from rag.chroma import VectorStore
@@ -30,7 +31,7 @@ class PortfolioAgent:
     Supports automatic provider failover — if one LLM provider runs out of credits
     (429/402/403 quota errors), it automatically falls back to the next configured provider.
 
-    Priority order: Groq → Gemini → Ollama
+    Priority order: Groq → Gemini → NVIDIA NIM → Ollama
     """
 
     _instance: PortfolioAgent | None = None
@@ -70,7 +71,7 @@ class PortfolioAgent:
     def _init_providers(self):
         """Initialize all configured providers in priority order.
 
-        Priority: Groq → Gemini → Ollama
+        Priority: Groq → Gemini → NVIDIA NIM → Ollama
         Only initializes providers that have their API keys configured.
         """
         self._providers = []
@@ -83,6 +84,11 @@ class PortfolioAgent:
 
         if os.getenv("GEMINI_API_KEY"):
             provider = GeminiProvider()
+            self._providers.append(provider)
+            logger.info("Registered provider: %s (%s)", provider.name, provider.model_name)
+
+        if os.getenv("NVIDIA_API_KEY"):
+            provider = NIMProvider()
             self._providers.append(provider)
             logger.info("Registered provider: %s (%s)", provider.name, provider.model_name)
 
@@ -172,15 +178,25 @@ class PortfolioAgent:
     ) -> tuple[str, str]:
         """Try to generate a response, failing over between providers on quota errors.
 
+        Logs each provider's specific failure reason separately so it's clear
+        exactly why each provider was skipped.
+
         Returns:
             Tuple of (response_text, provider_name).
         """
         last_error = None
+        failure_log = []
 
         while True:
             provider = self._get_next_provider()
             if not provider:
-                # All providers exhausted
+                # All providers exhausted — log the full failure chain
+                for entry in failure_log:
+                    logger.warning(
+                        "Provider failure chain | %s | reason=%s",
+                        entry["provider"],
+                        entry["reason"],
+                    )
                 if last_error:
                     raise last_error
                 raise RuntimeError("No LLM providers available")
@@ -196,12 +212,20 @@ class PortfolioAgent:
             except ProviderQuotaExceeded as e:
                 # Provider ran out of credits — mark as failed and try next
                 self._failed_providers.add(provider.name)
+                # Extract a concise reason from the error message
+                reason = self._extract_quota_reason(str(e))
+                failure_log.append({
+                    "provider": provider.name,
+                    "reason": reason,
+                    "status_code": e.status_code,
+                })
                 logger.warning(
-                    "Provider '%s' quota exceeded (HTTP %d). Marking as failed. "
-                    "Failed providers: %s",
+                    "Provider '%s' failed | type=quota | status=%d | reason=%s | "
+                    "remaining_providers=%s",
                     provider.name,
                     e.status_code,
-                    self._failed_providers,
+                    reason,
+                    [p.name for p in self._providers if p.name not in self._failed_providers],
                 )
                 last_error = e
                 # Continue loop to try next provider
@@ -209,12 +233,32 @@ class PortfolioAgent:
             except Exception as e:
                 # Non-quota error — mark as failed too (something's wrong)
                 self._failed_providers.add(provider.name)
-                logger.exception(
-                    "Provider '%s' failed with non-quota error. Marking as failed.",
+                reason = f"{type(e).__name__}: {e!s}"
+                failure_log.append({
+                    "provider": provider.name,
+                    "reason": reason,
+                    "status_code": getattr(e, "status_code", None),
+                })
+                logger.error(
+                    "Provider '%s' failed | type=error | reason=%s | "
+                    "remaining_providers=%s",
                     provider.name,
+                    reason,
+                    [p.name for p in self._providers if p.name not in self._failed_providers],
                 )
                 last_error = e
                 # Continue loop to try next provider
+
+    @staticmethod
+    def _extract_quota_reason(error_message: str) -> str:
+        """Extract a concise quota reason from a verbose provider error."""
+        # Try to extract the status message portion
+        if "RESOURCE_EXHAUSTED" in error_message:
+            return "rate_limit_exceeded"
+        if "quota" in error_message.lower():
+            # Truncate to first 120 chars for readability
+            return error_message[:120]
+        return error_message[:100]
 
     async def run(self, messages: list[dict], session_id: str = "") -> dict[str, Any]:
         """Process a conversation turn and return the response."""
@@ -244,7 +288,7 @@ class PortfolioAgent:
                 tool_used = tool.name
                 logger.info("Tool used: %s", tool_used)
             except Exception as e:
-                logger.exception("Tool execution failed: %s", tool_used)
+                logger.error("Tool execution failed: %s | error=%s: %s", tool_used, type(e).__name__, e)
                 tool_result = None
         else:
             try:
@@ -253,7 +297,12 @@ class PortfolioAgent:
                     tool_result = results
                     tool_used = "portfolio_search"
             except Exception as e:
-                logger.exception("Vector search failed")
+                # RAG failure is non-fatal — LLM still runs without context
+                logger.warning(
+                    "RAG vector search failed (non-fatal) | error=%s: %s | "
+                    "LLM will respond without portfolio context",
+                    type(e).__name__, e,
+                )
                 tool_result = None
 
         # Step 4: Build system prompt with context

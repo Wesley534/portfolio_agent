@@ -36,6 +36,7 @@ COPY . .
 # Create non-root user
 RUN addgroup --system app && adduser --system --group app && \
     chown -R app:app /app
+ENV HOME=/tmp
 USER app
 
 # Health check
